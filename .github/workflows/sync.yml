@@ -1,34 +1,123 @@
-name: Synchronisation Calendrier NEOMA
+import datetime
+import urllib.request
+import xml.etree.ElementTree as ET
+import sys
 
-on:
-  schedule:
-    # S'exécute automatiquement toutes les 4 heures
-    - cron: '0 */4 * * *'
-  # Permet aussi de déclencher la mise à jour manuellement si besoin
-  workflow_dispatch:
+SOAP_URL = "https://neoma-ws.neoma-bs.fr/Ws_InterfacesAurion/WsAppSchoAurion.asmx"
+EMAIL = "adel.leherisse.24@neoma-bs.com"
 
-permissions:
-  contents: write
+# Calcul dynamique des dates
+now = datetime.datetime.now(datetime.timezone.utc)
+start_date = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT00:00:00.000Z")
+end_date = (now + datetime.timedelta(days=365)).strftime("%Y-%m-%dT00:00:00.000Z")
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+payload = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ListePlanningMyNeomagora xmlns="https://neoma-ws.neoma-bs.fr">
+      <Mail>{EMAIL}</Mail>
+      <DateDebut_Seance>{start_date}</DateDebut_Seance>
+      <DateFin_Seance>{end_date}</DateFin_Seance>
+    </ListePlanningMyNeomagora>
+  </soap:Body>
+</soap:Envelope>"""
 
-    steps:
-      - name: Récupérer le dépôt
-        uses: actions/checkout@v4
+headers = {
+    "Content-Type": "text/xml; charset=utf-8",
+    "SOAPAction": '"https://neoma-ws.neoma-bs.fr/ListePlanningMyNeomagora"',
+    "Origin": "https://neoma.sharepoint.com",
+    "Referer": "https://neoma.sharepoint.com/",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
-      - name: Configurer Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
+print(f"Envoi de la requête SOAP pour {EMAIL}...")
+req = urllib.request.Request(SOAP_URL, data=payload.encode("utf-8"), headers=headers, method="POST")
 
-      - name: Télécharger et convertir le planning
-        run: python update_calendar.py
+try:
+    with urllib.request.urlopen(req, timeout=30) as response:
+        xml_data = response.read().decode("utf-8")
+        print(f"Réponse reçue du serveur ({len(xml_data)} octets).")
+except Exception as e:
+    print(f"ERREUR HTTP/Réseau : {e}")
+    sys.exit(1)
 
-      - name: Sauvegarder le fichier planning.ics
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add planning.ics
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Mise à jour automatique du planning" && git push)
+def parse_date_to_ics(dt_str):
+    clean = dt_str.replace("-", "").replace(":", "")
+    if "T" in clean:
+        return clean.split(".")[0]
+    return clean
+
+# Découpage du XML
+root = ET.fromstring(xml_data)
+sessions = root.findall(".//{https://neoma-ws.neoma-bs.fr}Ent_AppSchoPlanning")
+if not sessions:
+    sessions = root.findall(".//Ent_AppSchoPlanning")
+
+print(f"Nombre de séances trouvées dans le XML : {len(sessions)}")
+
+if not sessions:
+    print("ATTENTION : Aucune séance détectée dans le XML.")
+    print("Extrait de la réponse :", xml_data[:500])
+    sys.exit(1)
+
+ics_lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//NEOMA//Planning Aurion Sync//FR",
+    "CALSCALE:GREGORIAN",
+    "METHOD:PUBLISH",
+    "X-WR-CALNAME:NEOMA - Emploi du temps",
+    "X-WR-TIMEZONE:Europe/Paris"
+]
+
+dtstamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+for s in sessions:
+    def get_field(tag):
+        node = s.find(f"{{https://neoma-ws.neoma-bs.fr}}{tag}")
+        if node is None:
+            node = s.find(tag)
+        return node.text.strip().replace('"', "") if (node is not None and node.text) else ""
+
+    id_seance = get_field("IdSeance")
+    debut = get_field("Debut")
+    fin = get_field("Fin")
+    cours = get_field("UC")
+    salle = get_field("Salle")
+    prof = get_field("Professeurs")
+    type_seance = get_field("TypeSeance")
+    carto = get_field("AliasCartographie")
+
+    if not debut or not fin:
+        continue
+
+    dtstart = parse_date_to_ics(debut)
+    dtend = parse_date_to_ics(fin)
+
+    desc_parts = []
+    if type_seance:
+        desc_parts.append(f"Type: {type_seance}")
+    if prof and prof != ".":
+        desc_parts.append(f"Professeur: {prof}")
+    if carto:
+        desc_parts.append(f"Plan salle: {carto}")
+    description = "\\n".join(desc_parts)
+
+    ics_lines.extend([
+        "BEGIN:VEVENT",
+        f"UID:neoma-{id_seance}@neoma-bs.fr",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART:{dtstart}",
+        f"DTEND:{dtend}",
+        f"SUMMARY:{cours}",
+        f"LOCATION:{salle}",
+        f"DESCRIPTION:{description}",
+        "END:VEVENT"
+    ])
+
+ics_lines.append("END:VCALENDAR")
+
+with open("planning.ics", "w", encoding="utf-8") as f:
+    f.write("\r\n".join(ics_lines))
+
+print("Fichier planning.ics généré avec succès.")
